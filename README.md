@@ -32,6 +32,7 @@ python enrich.py YOUR_FILE.xlsx --out result.xlsx     # custom output name
 python enrich.py YOUR_FILE.xlsx --link-col "Post Link" --platform-col "Platform"
 python enrich.py YOUR_FILE.xlsx --sleep 1.5            # slower = safer vs rate limits
 python enrich.py YOUR_FILE.xlsx --max 20               # test on first 20 rows only
+python enrich.py YOUR_FILE.xlsx --rows                 # 2-20 row , 1 is header
 ```
 
 ## How it works
