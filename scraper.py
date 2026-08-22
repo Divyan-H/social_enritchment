@@ -1,21 +1,26 @@
 """
 scraper.py — visits an Instagram or YouTube post link and pulls:
-  - post description / caption
-  - account handle
-  - followers (Instagram) / subscribers (YouTube)
-  - following (Instagram only)
+  - post description / caption, likes, comments, hashtags, mentions, etc.
+  - account handle, followers/following, bio, verification, business info
+  - subscribers (YouTube)
 
 Strategy:
-  YouTube            -> yt-dlp (subscriber count comes free in the same call)
-  Instagram (any post)-> yt-dlp first (works for many public reels/posts and
-                          also returns follower count directly when available)
-  Instagram fallback  -> embed page scrape for caption + handle, then a
-                          second request to instagram.com/<user>/ to parse
-                          followers/following/posts out of the public
-                          og:description meta tag.
+  YouTube      -> yt-dlp (subscriber count comes free in the same call)
+  Instagram    -> Apify's Instagram Scraper actor (apify_client.py), when an
+                  APIFY_API_TOKEN is configured. This is the reliable, paid
+                  path and is used first whenever a token is available - it
+                  also returns much richer data (likes, comments, bio,
+                  verification, business category, etc.) than the free path.
+  Instagram
+  fallback     -> best-effort unauthenticated scrape (yt-dlp, then IG's
+                  public embed/profile pages). Used only when no Apify
+                  token is configured, or Apify returns nothing for a
+                  given URL. Much less reliable - Instagram serves a
+                  login wall to most unauthenticated automated requests -
+                  kept here mainly so the tool still runs with zero setup.
 
 Every account is only looked up ONCE per run (in-memory cache), so a sheet
-with many rows from the same creator doesn't cost extra requests.
+with many rows from the same creator doesn't cost extra requests/credits.
 """
 import re
 import time
@@ -32,6 +37,8 @@ try:
     _YTDLP = True
 except ImportError:
     _YTDLP = False
+
+import apify_client
 
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -57,6 +64,25 @@ class ScrapedPost:
     subscribers: Optional[int] = None   # YouTube subscribers
     genre: str = ""
     genre_confidence: float = 0.0
+    # Extra fields available when Apify is used for Instagram
+    likes: Optional[int] = None
+    comments: Optional[int] = None
+    video_views: Optional[int] = None
+    post_type: str = ""
+    post_timestamp: str = ""
+    hashtags: list = field(default_factory=list)
+    mentions: list = field(default_factory=list)
+    location: str = ""
+    is_sponsored: Optional[bool] = None
+    posts_count: Optional[int] = None
+    biography: str = ""
+    full_name: str = ""
+    is_verified: Optional[bool] = None
+    is_private: Optional[bool] = None
+    is_business_account: Optional[bool] = None
+    business_category: str = ""
+    external_url: str = ""
+    source: str = ""            # "apify" | "ytdlp" | "embed_fallback"
 
 
 # ── small helpers ────────────────────────────────────────────────────────
@@ -141,13 +167,17 @@ class DomainThrottle:
 
 _throttle = DomainThrottle()
 
-# in-memory cache: account handle -> {followers, following, subscribers}
+# in-memory cache: account handle -> profile dict (free-path fallback)
 _profile_cache: dict[str, dict] = {}
 _profile_fail_cache: dict[str, str] = {}
 _profile_cache_lock = threading.Lock()
 
+# in-memory cache: account handle -> profile fields dict (Apify path)
+_apify_profile_cache: dict[str, dict] = {}
+_apify_profile_cache_lock = threading.Lock()
 
-# ── yt-dlp based fetch (used for both YouTube and Instagram) ───────────────
+
+# ── yt-dlp based fetch (used for YouTube, and as one fallback for Instagram) ─
 
 def _fetch_ytdlp(url: str) -> Optional[dict]:
     if not _YTDLP:
@@ -176,7 +206,30 @@ def _fetch_ytdlp(url: str) -> Optional[dict]:
         return None
 
 
-# ── Instagram-specific fallback (embed page + profile page) ────────────────
+def fetch_youtube_channel_info(handle_or_url: str) -> Optional[dict]:
+    """Fetch YouTube channel stats via yt-dlp for a handle (@channel) or URL."""
+    if not handle_or_url:
+        return None
+    h = str(handle_or_url).strip()
+    if h.startswith("http"):
+        url = h
+    elif h.startswith("@"):
+        url = f"https://www.youtube.com/{h}"
+    else:
+        url = f"https://www.youtube.com/@{h}"
+    data = _fetch_ytdlp(url)
+    if not data:
+        return None
+    return {
+        "channel_name": data.get("handle") or "",
+        "subscribers": data.get("followers_or_subs"),
+        "description": data.get("description") or "",
+        "video_count": None,
+    }
+
+
+
+# ── Instagram free-path fallback (embed page + profile page) ───────────────
 
 def _extract_ig_username(html: str) -> str:
     m = re.search(r'class="[^"]*UsernameText[^"]*"[^>]*>([A-Za-z0-9_.]+)<', html)
@@ -271,9 +324,92 @@ def get_profile_fail_reason(username: str) -> str:
     return _profile_fail_cache.get((username or "").lower(), "")
 
 
+def _fetch_apify_profile_cached(username: str, token: str) -> dict:
+    key = username.lower()
+    with _apify_profile_cache_lock:
+        if key in _apify_profile_cache:
+            return _apify_profile_cache[key]
+    raw = apify_client.fetch_profile(username, token)
+    fields = apify_client.extract_profile_fields(raw)
+    with _apify_profile_cache_lock:
+        _apify_profile_cache[key] = fields
+    return fields
+
+
+def _apply_apify_post_fields(sp: "ScrapedPost", post_fields: dict):
+    sp.description = post_fields.get("description", "")
+    sp.handle = post_fields.get("handle", "")
+    sp.likes = post_fields.get("likes")
+    sp.comments = post_fields.get("comments")
+    sp.video_views = post_fields.get("video_views")
+    sp.post_type = post_fields.get("post_type") or ""
+    sp.post_timestamp = str(post_fields.get("timestamp") or "")
+    sp.hashtags = post_fields.get("hashtags") or []
+    sp.mentions = post_fields.get("mentions") or []
+    sp.location = post_fields.get("location") or ""
+    sp.is_sponsored = post_fields.get("is_sponsored")
+
+
+def _apply_apify_profile_fields(sp: "ScrapedPost", prof: dict):
+    sp.followers = prof.get("followers")
+    sp.following = prof.get("following")
+    sp.posts_count = prof.get("posts_count")
+    sp.biography = prof.get("biography") or ""
+    sp.full_name = prof.get("full_name") or ""
+    sp.is_verified = prof.get("is_verified")
+    sp.is_private = prof.get("is_private")
+    sp.is_business_account = prof.get("is_business_account")
+    sp.business_category = prof.get("business_category") or ""
+    ext = prof.get("external_url")
+    sp.external_url = ext if isinstance(ext, str) else (", ".join(ext) if ext else "")
+
+
+def _scrape_instagram_free_fallback(sp: "ScrapedPost", url: str, fail_reasons: list) -> "ScrapedPost":
+    """Best-effort unauthenticated scrape, used when Apify isn't configured
+    or came back empty. Unreliable - see module docstring."""
+    data = _fetch_ytdlp(url)
+    if data and data.get("description"):
+        sp.ok = True
+        sp.source = "ytdlp"
+        sp.description = data["description"]
+        sp.handle = data["handle"]
+        if data.get("followers_or_subs") is not None:
+            sp.followers = data["followers_or_subs"]
+    elif _YTDLP:
+        fail_reasons.append("yt-dlp: no usable data returned")
+
+    if not sp.ok or not sp.handle:
+        embed = _fetch_instagram_embed(url)
+        if embed.get("description") and not sp.description:
+            sp.description = embed["description"]
+            sp.ok = True
+            sp.source = "embed_fallback"
+        if embed.get("handle") and not sp.handle:
+            sp.handle = embed["handle"]
+        if embed.get("fail_reason"):
+            fail_reasons.append(f"embed: {embed['fail_reason']}")
+
+    if sp.handle and (sp.followers is None or sp.following is None):
+        stats = _fetch_instagram_profile_stats(sp.handle)
+        if stats:
+            if sp.followers is None:
+                sp.followers = stats.get("followers")
+            sp.following = stats.get("following")
+        else:
+            reason = get_profile_fail_reason(sp.handle)
+            if reason:
+                fail_reasons.append(f"profile: {reason}")
+
+    if not sp.ok:
+        detail = "; ".join(fail_reasons) if fail_reasons else "no data source succeeded"
+        sp.error = f"could not fetch this Instagram link ({detail})"
+
+    return sp
+
+
 # ── public entry point ──────────────────────────────────────────────────────
 
-def scrape_post(url: str, platform_hint: str = "") -> ScrapedPost:
+def scrape_post(url: str, platform_hint: str = "", apify_token: Optional[str] = None) -> ScrapedPost:
     from genre import classify_genre  # local import to avoid circulars in tests
 
     sp = ScrapedPost(url=url)
@@ -288,6 +424,7 @@ def scrape_post(url: str, platform_hint: str = "") -> ScrapedPost:
             data = _fetch_ytdlp(url)
             if data:
                 sp.ok = True
+                sp.source = "ytdlp"
                 sp.description = data["description"]
                 sp.handle = data["handle"]
                 sp.subscribers = data["followers_or_subs"]
@@ -297,43 +434,28 @@ def scrape_post(url: str, platform_hint: str = "") -> ScrapedPost:
         elif sp.platform == "instagram":
             fail_reasons = []
 
-            # Try yt-dlp first (works for many reels, sometimes gives follower count)
-            data = _fetch_ytdlp(url)
-            if data and data.get("description"):
-                sp.ok = True
-                sp.description = data["description"]
-                sp.handle = data["handle"]
-                if data.get("followers_or_subs") is not None:
-                    sp.followers = data["followers_or_subs"]
-            elif _YTDLP:
-                fail_reasons.append("yt-dlp: no usable data returned")
+            if apify_token:
+                try:
+                    raw_post = apify_client.fetch_post(url, apify_token)
+                except PermissionError as e:
+                    sp.error = str(e)
+                    return sp  # bad token - stop immediately, don't burn more calls
 
-            # Fill gaps / fallback via embed page
-            if not sp.ok or not sp.handle:
-                embed = _fetch_instagram_embed(url)
-                if embed.get("description") and not sp.description:
-                    sp.description = embed["description"]
+                post_fields = apify_client.extract_post_fields(raw_post)
+                if post_fields.get("description") or post_fields.get("handle"):
                     sp.ok = True
-                if embed.get("handle") and not sp.handle:
-                    sp.handle = embed["handle"]
-                if embed.get("fail_reason"):
-                    fail_reasons.append(f"embed: {embed['fail_reason']}")
+                    sp.source = "apify"
+                    _apply_apify_post_fields(sp, post_fields)
 
-            # Followers/following from the account's public profile page
-            if sp.handle and (sp.followers is None or sp.following is None):
-                stats = _fetch_instagram_profile_stats(sp.handle)
-                if stats:
-                    if sp.followers is None:
-                        sp.followers = stats.get("followers")
-                    sp.following = stats.get("following")
+                    if sp.handle:
+                        prof = _fetch_apify_profile_cached(sp.handle, apify_token)
+                        if prof:
+                            _apply_apify_profile_fields(sp, prof)
                 else:
-                    reason = get_profile_fail_reason(sp.handle)
-                    if reason:
-                        fail_reasons.append(f"profile: {reason}")
+                    fail_reasons.append("apify: no data returned (post may be private/removed, or actor found nothing)")
 
             if not sp.ok:
-                detail = "; ".join(fail_reasons) if fail_reasons else "no data source succeeded"
-                sp.error = f"could not fetch this Instagram link ({detail})"
+                sp = _scrape_instagram_free_fallback(sp, url, fail_reasons)
 
         # Genre classification (offline, keyword-based)
         if sp.description or sp.handle:
@@ -345,3 +467,61 @@ def scrape_post(url: str, platform_hint: str = "") -> ScrapedPost:
         sp.error = f"{type(e).__name__}: {e}"
 
     return sp
+
+
+# ── batch entry point (fast path for Instagram-heavy sheets) ───────────────
+
+def scrape_instagram_urls_batch(urls: list, apify_token: str) -> dict:
+    """Scrape many Instagram post URLs in as few Apify actor runs as
+    possible: one batched call for all posts, one batched call for all
+    the distinct owning profiles, both chunked+parallelized inside
+    apify_client. Falls back to the free per-URL scrape only for URLs
+    Apify didn't return anything for (should be the rare exception, not
+    the common case).
+
+    Returns {url: ScrapedPost}, one entry per input URL (deduped
+    internally, but every input url gets a result).
+    """
+    from genre import classify_genre
+
+    urls = list(dict.fromkeys(urls))
+    results = {u: ScrapedPost(url=u, platform="instagram") for u in urls}
+
+    posts_by_url = apify_client.fetch_posts_batch(urls, apify_token)
+
+    handles_needed = set()
+    for u in urls:
+        raw = posts_by_url.get(u)
+        post_fields = apify_client.extract_post_fields(raw) if raw else {}
+        sp = results[u]
+        if post_fields.get("description") or post_fields.get("handle"):
+            sp.ok = True
+            sp.source = "apify"
+            _apply_apify_post_fields(sp, post_fields)
+            if sp.handle:
+                handles_needed.add(sp.handle)
+
+    if handles_needed:
+        profiles_by_handle = apify_client.fetch_profiles_batch(list(handles_needed), apify_token)
+        for u in urls:
+            sp = results[u]
+            if sp.handle and sp.handle in profiles_by_handle:
+                prof_raw = profiles_by_handle[sp.handle]
+                if prof_raw:
+                    _apply_apify_profile_fields(sp, apify_client.extract_profile_fields(prof_raw))
+
+    # Fallback only for the URLs Apify genuinely gave us nothing for.
+    missed = [u for u in urls if not results[u].ok]
+    for u in missed:
+        sp = results[u]
+        sp = _scrape_instagram_free_fallback(sp, u, ["apify: no item returned for this URL in the batch"])
+        results[u] = sp
+
+    for u in urls:
+        sp = results[u]
+        if sp.description or sp.handle:
+            genre, conf = classify_genre(sp.description, sp.handle)
+            sp.genre = genre
+            sp.genre_confidence = conf
+
+    return results

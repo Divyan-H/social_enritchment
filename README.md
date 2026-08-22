@@ -1,53 +1,126 @@
-# Social Post Enrichment (Instagram + YouTube)
+# Social Data Enrichment (Instagram & YouTube)
 
-Reads your campaign Excel, visits every post link, and adds these columns:
+A high-performance pipeline for enriching campaign and influencer Excel spreadsheets with post engagement, creator profile statistics, and content genre classification for **Instagram** and **YouTube**.
 
-| Column | Meaning |
-|---|---|
-| `enr_genre` | Content genre/category the creator is posting (comedy, educational, lifestyle, food, travel, fashion_beauty, fitness_health, music_dance, tech, gaming, promotional, review, etc.) — detected from the caption/description |
-| `enr_account_handle` | The username/channel that posted it |
-| `enr_followers` | Instagram followers (blank for YouTube) |
-| `enr_following` | Instagram following (blank for YouTube) |
-| `enr_subscribers` | YouTube subscribers (blank for Instagram) |
-| `enr_post_description` | The post's caption / video description |
-| `enr_status` | `ok`, `no link`, or `failed: <reason>` |
+---
 
-Nothing else is touched — your original columns are kept exactly as they are.
+## 🚀 Overview & Pipelines
 
-## Install
+This repository provides two specialized enrichment pipelines depending on the format of your input data:
+
+| Pipeline Script | Best Used When | What It Enriches |
+| :--- | :--- | :--- |
+| **`enrich.py`** | Your spreadsheet contains **Post / Video URLs** in a dedicated column (e.g., `"Post Link"`). | Post metrics (likes, comments, views, caption, tags) + Owner profile data (followers, following, bio, verification, etc.) + Genre. |
+| **`enrich_handles.py`** | Your spreadsheet contains **Hyperlinks, Profile Handles, or mixed Post Links** in a column (e.g., `"Social Handle"`). | Automatically resolves embedded Excel hyperlinks, handles creator handles/URLs, skips noise/headers (e.g., `'2022-23'`), and pulls full account & post metrics. |
+
+---
+
+## 📊 Enriched Columns Schema
+
+Both pipelines output identical, standardized `enr_*` columns while preserving all your original sheet columns:
+
+| Output Column | Description |
+| :--- | :--- |
+| `enr_genre` | Classified content genre (e.g., *comedy, fashion_beauty, food, tech, lifestyle, educational, fitness_health, review, promotional*) |
+| `enr_genre_confidence` | Confidence score (0.0 to 1.0) of the genre classification |
+| `enr_account_handle` | Instagram account username or YouTube channel handle |
+| `enr_full_name` | Creator / Channel display name |
+| `enr_followers` | Instagram follower count |
+| `enr_following` | Instagram following count |
+| `enr_subscribers` | YouTube subscriber count |
+| `enr_posts_count` | Total posts / video count |
+| `enr_biography` | Instagram profile bio or YouTube channel description |
+| `enr_is_verified` | Verification badge status (`True` / `False`) |
+| `enr_is_private` | Account privacy status (`True` / `False`) |
+| `enr_is_business_account` | Whether the account is a registered business profile |
+| `enr_business_category` | Instagram business/creator category |
+| `enr_external_url` | Bio link / website URL(s) |
+| `enr_post_description` | Post caption or video description |
+| `enr_likes` | Post likes count |
+| `enr_comments` | Post comments count |
+| `enr_video_views` | Video / Reel view count |
+| `enr_post_type` | Post format (`Image`, `Video`, `Sidecar`, `Reel`, etc.) |
+| `enr_post_timestamp` | Publication timestamp |
+| `enr_hashtags` | Extracted hashtags |
+| `enr_mentions` | Extracted `@mentions` |
+| `enr_location` | Geotagged location name |
+| `enr_is_sponsored` | Sponsored / paid partnership flag |
+| `enr_source` | Scraping provider used (`apify`, `ytdlp`, or `free_fallback`) |
+| `enr_status` | Status of the row (`ok`, `no link`, `skipped`, or `failed: <reason>`) |
+
+---
+
+## ⚙️ Installation
+
+1. **Clone the repository**:
+   ```bash
+   git clone <repository_url>
+   cd social_enrichment
+   ```
+
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Set your Apify API Token** (recommended for full metrics & fast batched processing):
+   - **Linux / macOS**:
+     ```bash
+     export APIFY_API_TOKEN="apify_api_xxxxxxxxxxxxxxxxxxxxxxxx"
+     ```
+   - **Windows (PowerShell)**:
+     ```powershell
+     $env:APIFY_API_TOKEN="apify_api_xxxxxxxxxxxxxxxxxxxxxxxx"
+     ```
+   - **Windows (CMD)**:
+     ```cmd
+     set APIFY_API_TOKEN=apify_api_xxxxxxxxxxxxxxxxxxxxxxxx
+     ```
+
+---
+
+## 🏃 Usage Examples
+
+### 1. Enriching Hyperlinks & Social Handles (`enrich_handles.py`)
+
+Handles embedded Excel hyperlink targets, mixed post/profile URLs, and usernames:
+
 ```bash
-pip install -r requirements.txt
+# Basic run (auto-detects 'Social Handle' column)
+python enrich_handles.py input_sheet.xlsx --out result.xlsx
+
+# Test on the first 20 rows
+python enrich_handles.py input_sheet.xlsx --max 20
+
+# Run specific row ranges (1-indexed matching Excel rows)
+python enrich_handles.py input_sheet.xlsx --rows 2,5,10-25
+
+# Specify custom handle/link column
+python enrich_handles.py input_sheet.xlsx --handles-col "Social Handle"
 ```
 
-## Run
+### 2. Enriching Post Links (`enrich.py`)
+
+Visits individual Instagram and YouTube post URLs:
+
 ```bash
-python enrich.py YOUR_FILE.xlsx
-```
-Produces `YOUR_FILE_enriched.xlsx` in the same folder — one file, with every
-original column plus the `enr_*` enrichment columns above.
+# Basic run (defaults to 'Post Link' column)
+python enrich.py campaign_posts.xlsx --out campaign_enriched.xlsx
 
-Options:
-```bash
-python enrich.py YOUR_FILE.xlsx --out result.xlsx     # custom output name
-python enrich.py YOUR_FILE.xlsx --link-col "Post Link" --platform-col "Platform"
-python enrich.py YOUR_FILE.xlsx --sleep 1.5            # slower = safer vs rate limits
-python enrich.py YOUR_FILE.xlsx --max 20               # test on first 20 rows only
-python enrich.py YOUR_FILE.xlsx --rows                 # 2-20 row , 1 is header
+# Custom column names and parallel YouTube workers
+python enrich.py campaign_posts.xlsx --link-col "URL" --youtube-workers 8
+
+# Run specific row ranges (1-indexed matching Excel rows, 2 = first data row)
+python enrich.py campaign_posts.xlsx --rows 2,5,10-25
 ```
 
-## How it works
-- **YouTube** — `yt-dlp` pulls the description + subscriber count in one call.
-- **Instagram** — `yt-dlp` is tried first; if a post/handle info is missing,
-  it falls back to Instagram's public embed page for the caption, then a
-  second request to `instagram.com/<username>/` to read followers/following
-  off the public page. Each account is only looked up **once per run**, so
-  a creator with many rows in your sheet doesn't cost extra requests.
-- **Genre** — a fast offline keyword classifier reads the caption + handle.
-  No LLM, no API key, no internet call needed for this step.
+---
 
-## Notes / limitations
-- Private accounts, deleted posts, or heavy rate-limiting on Instagram's side
-  will show up as `enr_status = failed: ...` for that row — it never stops
-  the rest of the run.
-- Only Instagram and YouTube links are supported (per your data).
-- This needs to be run somewhere with real internet access to Instagram/YouTube.
+## ⚡ Architecture & Performance Features
+
+- **Hyperlink Target Extraction**: Uses `openpyxl` to extract underlying URL targets from formatted display text, sheet hyperlinks, and `=HYPERLINK()` formulas.
+- **High-Throughput Apify Batching**: Groups hundreds of URLs/handles into concurrent Apify actor runs to minimize cold-start latency and optimize credit usage.
+- **Smart Handle & Header Filter**: Accurately differentiates social handles and URLs from plain-text headers (e.g. `'2022-23'`), categories, or empty rows.
+- **Parallel & Non-Blocking YouTube Fetching**: Leverages multi-threaded `yt-dlp` execution with `extract_flat=True`, socket timeouts, and HTML fallback to prevent channel hangs.
+- **In-Memory Caching & Deduplication**: Repeated handles and creators across large sheets are fetched only once per run.
+- **Offline Genre Classifier**: Heuristic-based keyword classification across 17 categories without external API latency or cost.
